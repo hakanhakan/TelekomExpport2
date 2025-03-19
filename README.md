@@ -1,235 +1,97 @@
-# Multi-Session IBT Property Extraction System
+Below is an example of a comprehensive README.md file that explains the project, its structure, usage, and recent changes (including the fact that functionality from ibt_property_search.py is now merged into property_data.py and that the project uses uv for package management):
 
-This system provides a robust solution for extracting property information from the Telekom IBT portal using multiple browser sessions in parallel. It's designed to handle large datasets efficiently while providing resilience against failures.
+# TelekomExpport2 Scraper
+
+TelekomExpport2 is a multi-session web scraper that logs into the Telekom IBT Order Portal, handles OTP-based authentication robustly, and extracts detailed property and owner data from the search results. The extracted data is saved to an SQLite database and can be reviewed in a tabulated format.
+
+> **Note:** Functionality previously maintained in `ibt_property_search.py` has been merged into `property_data.py`. You can now remove the `ibt_property_search.py` file.
 
 ## Features
 
-- **Multi-Session Processing**: Run multiple browser sessions in parallel to speed up extraction
-- **Checkpointing**: Automatically save progress to a SQLite database to resume after interruptions
-- **Resilience**: Automatically recover from failures and continue processing
-- **Progress Monitoring**: Real-time statistics on extraction progress
-- **Export Options**: Export results to Excel and CSV formats
+- **Robust OTP Handling:** Uses a custom OTP input routine with automatic retries for authentication.
+- **Concurrent Sessions:** Runs multiple sessions concurrently to speed up the extraction process.
+- **Property & Owner Data Extraction:** Extracts property details (e.g., FoL-ID, street, house number, house number appendix) as well as owner information (name, email, mobile, and landline).  
+- **Integrated Package Management:** Uses **uv** for package management.
+- **Data Storage:** Saves all extracted data into an SQLite database (`extraction.db`).
 
-## Installation
+## Requirements
 
-### Prerequisites
+- Python 3.12+
+- [Playwright](https://playwright.dev/python/)
+- [aiosqlite](https://pypi.org/project/aiosqlite/)
+- [rich](https://pypi.org/project/rich/)
+- [tabulate](https://pypi.org/project/tabulate/)
+- **uv** (for package management; install via pip if not already installed: `pip install uv`)
 
-- Python 3.8 or higher
-- Playwright for Python
-- Required Python packages
+## Setup
 
-### Setup
+1. **Clone the Repository:**
 
-1. Install the required Python packages using the provided requirements.txt file:
+   ```bash
+   git clone <repository_url>
+   cd TelekomExpport2
 
-```bash
-pip install -r requirements.txt
-```
+	2.	Install Dependencies with uv:
+Ensure you have uv installed globally. Then, install all required packages with:
 
-2. Install Playwright browsers:
+uv install
 
-```bash
-playwright install
-```
 
-3. Set up environment variables by copying the template:
+	3.	Configure Environment Variables:
+Set the following environment variables (you can use your shell configuration or a .env file):
+	•	TELEKOM_USERNAME: Your Telekom username.
+	•	TELEKOM_PASSWORD: Your Telekom password.
+	•	TELEKOM_OTP_SECRET: Your OTP secret (used for generating the one-time passwords).
 
-```bash
-cp .env.template .env
-```
+Usage
 
-Then edit the `.env` file with your credentials:
+Run the main script using uv:
 
-```
-TELEKOM_USERNAME=your_username
-TELEKOM_PASSWORD=your_password
-TELEKOM_OTP_SECRET=your_otp_secret  # Optional
-```
+uv run debug_multiple_robust_otp.py
 
-## Usage
+The script will:
+	•	Launch multiple sessions.
+	•	Log in to the Telekom portal using robust OTP handling.
+	•	Extract property data across multiple pages.
+	•	Save the extracted data into extraction.db.
 
-### One-Step Extraction
+Code Structure
+	•	debug_multiple_robust_otp.py:
+The main script that initializes multiple sessions, performs OTP-based login, extracts property data, and manages page navigation and concurrent processing.
+	•	property_data.py:
+Contains functions and classes for processing property and owner data. This module now includes functionality originally from ibt_property_search.py, so that file is no longer necessary.
+	•	ibt_property_search.py:
+(Deprecated) The code in this file has been merged into property_data.py for a streamlined codebase.
 
-For convenience, scripts are provided that run the entire extraction process from start to finish:
+How It Works
+	1.	Login & OTP Handling:
+	•	The script uses a robust OTP routine that waits for the OTP input field, fills it with a freshly generated code (using pyotp and a custom TOTP implementation supporting SHA512), and submits the form.
+	•	It retries OTP input a specified number of times if the field does not verify the correct value.
+	2.	Data Extraction:
+	•	Once logged in, the scraper navigates the property search results.
+	•	For each property row, it extracts static data (e.g., FoL-ID, street, house number) and then clicks to view property details.
+	•	The process_property function handles the extraction of owner details from the property’s Owner tab. It uses a try/except block to gracefully handle cases where the owner table does not appear within a timeout. In such cases, a status message is recorded in an extra column in the database.
+	3.	Pagination:
+	•	The scraper navigates through pages by clicking the next button (or directly selecting a page if possible) until all assigned pages are processed.
+	4.	Database Storage:
+	•	Extracted data is saved in an SQLite database (extraction.db) with columns for session ID, page, FoL-ID, street, house number, house appendix, owner details, and an execution status message (filled only if an error occurs during extraction).
 
-**Linux/macOS:**
-```bash
-./run_extraction.sh --area "Berlin" --sessions 4
-```
+Logging & Error Handling
+	•	Detailed logging is provided for every session, including OTP submission, data extraction for each property, and any errors (e.g., timeouts when waiting for elements).
+	•	When an element (like the property tab view or owner table) is not found within the specified timeout, a warning is logged and an error status is recorded in the database.
 
-**Windows:**
-```cmd
-run_extraction.bat --area "Berlin" --sessions 4
-```
+Contributing
 
-Options:
-- `--area`: Area to search for properties (default: Berlin)
-- `--sessions`: Number of parallel browser sessions (default: 4)
-- `--headless`: Run in headless mode (no visible browser windows)
-- `--db-path`: Path to the SQLite database file (default: property_extraction.db)
-- `--output-dir`: Directory to save extraction results (default: output)
-- `--analysis-dir`: Directory to save analysis results (default: analysis)
-- `--refresh`: Refresh interval in seconds for monitoring (default: 5)
-- `--help`: Show help message
+Contributions are welcome! Please fork the repository and submit a pull request with your improvements.
 
-These scripts will:
-1. Run the extraction process
-2. Monitor the progress
-3. Analyze the results when complete
+License
 
-### Testing the System
+This project is licensed under the MIT License.
 
-Before running a full extraction, it's recommended to test the system with a small sample:
+Acknowledgments
+	•	The project leverages Playwright for robust web automation.
+	•	The custom OTP handling extends the functionality of pyotp to support SHA512.
+	•	Thanks to the developers and the community behind the libraries used in this project.
+	•	Package management is streamlined with uv to simplify dependency management and deployment.
 
-```bash
-python test_extraction.py --excel-file "downloads/ibt-properties_20250306_123315.xlsx" --num-properties 5
-```
-
-Options:
-- `--excel-file`: Path to the Excel file with property IDs (required)
-- `--num-properties`: Number of properties to test with (default: 5)
-- `--sessions`: Number of parallel browser sessions (default: 2)
-- `--headless`: Run in headless mode (no visible browser windows)
-- `--db-path`: Path to the SQLite database file (default: test_extraction.db)
-- `--debug`: Enable debug logging
-- `--quiet`: Suppress non-essential output
-
-This will run a test extraction with a small number of properties to verify that the system is working correctly.
-
-### Initial Extraction
-
-To start a new extraction process:
-
-```bash
-python multi_session_extractor.py --area "Berlin" --sessions 4
-```
-
-Options:
-- `--area`: The area to search for properties (required)
-- `--sessions`: Number of parallel browser sessions (default: 4)
-- `--headless`: Run in headless mode (no visible browser windows)
-- `--db-path`: Path to the SQLite database file (default: property_extraction.db)
-- `--debug`: Enable debug logging
-- `--quiet`: Suppress non-essential output
-
-### Resume Extraction
-
-If the extraction process was interrupted, you can resume from an existing Excel file:
-
-```bash
-python resume_extraction.py --excel-file "downloads/ibt-properties_20250306_123315.xlsx" --sessions 4
-```
-
-Options:
-- `--excel-file`: Path to the Excel file with property IDs (required)
-- `--sessions`: Number of parallel browser sessions (default: 4)
-- `--headless`: Run in headless mode (no visible browser windows)
-- `--db-path`: Path to the SQLite database file (default: property_extraction.db)
-- `--debug`: Enable debug logging
-- `--quiet`: Suppress non-essential output
-
-### Monitoring Extraction Progress
-
-To monitor the progress of an ongoing extraction in a more visual way:
-
-```bash
-python monitor_extraction.py --db-path "property_extraction.db" --refresh 5
-```
-
-Options:
-- `--db-path`: Path to the SQLite database file (default: property_extraction.db)
-- `--refresh`: Refresh interval in seconds (default: 5)
-
-This will display a rich interface with:
-- Overall progress bar
-- Per-session progress bars
-- Extraction statistics (completion percentage, processing rate, estimated time remaining)
-- Recently completed properties
-- Recently failed properties
-
-The monitor will automatically exit when the extraction is complete, or you can press Ctrl+C to stop it at any time.
-
-### Analyzing Results
-
-After the extraction is complete, you can analyze the results to gain insights:
-
-```bash
-python analyze_results.py --db-path "property_extraction.db" --output-dir "analysis"
-```
-
-Options:
-- `--db-path`: Path to the SQLite database file (default: property_extraction.db)
-- `--output-dir`: Directory to save analysis results (default: analysis)
-
-This will generate:
-- Tables and charts showing extraction status
-- Distribution of properties by city
-- Distribution of properties by property status
-- Owner information statistics
-- Analysis of failure reasons
-- Summary of the extraction results
-
-The analysis results are saved to the specified output directory in both CSV and Excel formats, along with visualizations as PNG images.
-
-## Architecture
-
-The system consists of the following components:
-
-### Coordinator
-
-The `PropertyExtractionCoordinator` class manages the overall extraction process:
-- Downloads the Excel file with property data
-- Extracts property IDs from the Excel file
-- Initializes the database with property IDs
-- Starts and monitors worker sessions
-- Exports results when extraction is complete
-
-### Workers
-
-The `PropertyExtractionWorker` class handles property extraction in a single browser session:
-- Logs in to the IBT portal
-- Processes batches of properties
-- Reports progress to the coordinator
-- Implements retry logic for resilience
-
-### Database Manager
-
-The `DatabaseManager` class manages the SQLite database for checkpointing:
-- Tracks the status of each property (pending, in-progress, completed, failed)
-- Assigns properties to worker sessions
-- Stores extracted property data
-- Provides progress statistics
-- Exports results to Excel and CSV
-
-## Troubleshooting
-
-### Common Issues
-
-1. **Login Failures**:
-   - Check your credentials in the `.env` file
-   - Ensure your OTP secret is correct if using OTP authentication
-
-2. **Browser Crashes**:
-   - Reduce the number of parallel sessions
-   - Ensure your system has enough memory
-
-3. **Stalled Properties**:
-   - Properties that are stuck in "in-progress" state for more than 30 minutes will be automatically reset and reassigned
-
-4. **Database Errors**:
-   - If the database becomes corrupted, you can delete it and start fresh
-   - Use the resume_extraction.py script to restart from your Excel file
-
-### Logs
-
-Detailed logs are saved to:
-- `ibt_search.log`: Main log file for the IBT property search module
-- Console output: Real-time progress information
-
-## Output
-
-Extraction results are saved to the `output` directory in both Excel and CSV formats. The files are named with a timestamp to avoid overwriting previous results.
-
-## License
-
-This project is licensed under the MIT License - see the LICENSE file for details.
+You can save this content as `README.md` in your project root. Adjust any URLs or additional details as necessary.
