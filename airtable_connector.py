@@ -167,15 +167,55 @@ def get_area_record(area_name):
 
 def create_buildings_table(db_path="extraction.db"):
     conn = sqlite3.connect(db_path)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS buildings (
-            record_id TEXT PRIMARY KEY,
-            area_record_id TEXT,
-            building_name TEXT,
-            extra_field_1 TEXT,
-            last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
+    cursor = conn.cursor()
+    
+    # First check if table exists
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='buildings'")
+    table_exists = cursor.fetchone() is not None
+    
+    if not table_exists:
+        # If table doesn't exist, create it with all columns
+        conn.execute("""
+            CREATE TABLE buildings (
+                record_id TEXT PRIMARY KEY,
+                area_record_id TEXT,
+                building_name TEXT,
+                extra_field_1 TEXT,
+                extra_field_2 TEXT,
+                extra_field_3 TEXT,
+                first_name TEXT,
+                last_name TEXT,
+                phone_1 TEXT,
+                phone_2 TEXT,
+                email TEXT,
+                homes INTEGER,
+                offices INTEGER,
+                nvt TEXT,
+                last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        print("Created new buildings table with all columns")
+    else:
+        # Table exists, check if it has all required columns
+        required_columns = [
+            "extra_field_2", "extra_field_3", "first_name", "last_name",
+            "phone_1", "phone_2", "email", "homes", "offices", "nvt"
+        ]
+        
+        # Get existing columns
+        cursor.execute("PRAGMA table_info(buildings)")
+        existing_columns = [row[1] for row in cursor.fetchall()]
+        
+        # Add missing columns
+        for column in required_columns:
+            if column not in existing_columns:
+                column_type = "INTEGER" if column in ["homes", "offices"] else "TEXT"
+                try:
+                    cursor.execute(f"ALTER TABLE buildings ADD COLUMN {column} {column_type}")
+                    print(f"Added missing column {column} to buildings table")
+                except sqlite3.OperationalError as e:
+                    print(f"Error adding column {column}: {e}")
+    
     conn.commit()
     conn.close()
 
@@ -228,22 +268,81 @@ def sync_buildings_for_area(area_name, db_path="extraction.db"):
     for record in building_records:
         record_id = record.get("id")
         fields = record.get("fields", {})
-        # Assume that the building name is stored in the 'Name' field,
-        # and the FoL ID is stored in the 'Extra field 1' field.
+        
+        # Retrieve all needed fields from Airtable
         building_name = fields.get("Name")
         extra_field_1 = fields.get("Extra field 1")
         extra_field_1 = extract_fol_id(extra_field_1)
+        
+        # Get the additional fields
+        extra_field_2 = fields.get("Extra field 2")
+        extra_field_3 = fields.get("Extra field 3")
+        first_name = fields.get("First name")
+        last_name = fields.get("Last name")
+        phone_1 = fields.get("Phone 1")
+        phone_2 = fields.get("Phone 2")
+        email = fields.get("Email")
+        
+        # Convert numeric fields if available, otherwise default to 0
+        try:
+            homes = int(fields.get("HOMES", 0))
+        except (ValueError, TypeError):
+            homes = 0
+            
+        try:
+            offices = int(fields.get("OFFICES", 0))
+        except (ValueError, TypeError):
+            offices = 0
+            
+        nvt = fields.get("NVT")
+        
         if record_id and building_name:
-            cursor.execute("""
-                INSERT INTO buildings (record_id, area_record_id, building_name, extra_field_1)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(record_id) DO UPDATE SET
-                    area_record_id=excluded.area_record_id,
-                    building_name=excluded.building_name,
-                    extra_field_1=excluded.extra_field_1,
-                    last_updated=CURRENT_TIMESTAMP
-            """, (record_id, area_record_id, building_name, extra_field_1))
-            print(f"Synced building: {building_name} (Record ID: {record_id}), Extra field 1: {extra_field_1}")
+            try:
+                cursor.execute("""
+                    INSERT INTO buildings (
+                        record_id, area_record_id, building_name, extra_field_1,
+                        extra_field_2, extra_field_3, first_name, last_name, 
+                        phone_1, phone_2, email, homes, offices, nvt
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(record_id) DO UPDATE SET
+                        area_record_id=excluded.area_record_id,
+                        building_name=excluded.building_name,
+                        extra_field_1=excluded.extra_field_1,
+                        extra_field_2=excluded.extra_field_2,
+                        extra_field_3=excluded.extra_field_3,
+                        first_name=excluded.first_name,
+                        last_name=excluded.last_name,
+                        phone_1=excluded.phone_1,
+                        phone_2=excluded.phone_2,
+                        email=excluded.email,
+                        homes=excluded.homes,
+                        offices=excluded.offices,
+                        nvt=excluded.nvt,
+                        last_updated=CURRENT_TIMESTAMP
+                """, (
+                    record_id, area_record_id, building_name, extra_field_1,
+                    extra_field_2, extra_field_3, first_name, last_name,
+                    phone_1, phone_2, email, homes, offices, nvt
+                ))
+                print(f"Synced building: {building_name} (Record ID: {record_id})")
+            except sqlite3.Error as e:
+                print(f"Error syncing building {building_name}: {e}")
+                # If there was an error, we'll try a simpler insert with only the original columns
+                try:
+                    print("Attempting fallback insert with original columns only...")
+                    cursor.execute("""
+                        INSERT INTO buildings (record_id, area_record_id, building_name, extra_field_1)
+                        VALUES (?, ?, ?, ?)
+                        ON CONFLICT(record_id) DO UPDATE SET
+                            area_record_id=excluded.area_record_id,
+                            building_name=excluded.building_name,
+                            extra_field_1=excluded.extra_field_1,
+                            last_updated=CURRENT_TIMESTAMP
+                    """, (record_id, area_record_id, building_name, extra_field_1))
+                    print(f"Fallback sync successful for building: {building_name}")
+                except sqlite3.Error as e2:
+                    print(f"Fallback sync also failed: {e2}")
         else:
             print(f"Skipping record with missing ID or Name: {record}")
     conn.commit()
@@ -251,7 +350,11 @@ def sync_buildings_for_area(area_name, db_path="extraction.db"):
     cursor.execute("SELECT * FROM buildings")
     rows = cursor.fetchall()
     print("Current Buildings Table:")
-    print(tabulate(rows, headers=["record_id", "area_record_id", "building_name", "last_updated"], tablefmt="pretty"))
+    print(tabulate(rows, headers=[
+        "record_id", "area_record_id", "building_name", "extra_field_1", 
+        "extra_field_2", "extra_field_3", "first_name", "last_name", 
+        "phone_1", "phone_2", "email", "homes", "offices", "nvt", "last_updated"
+    ], tablefmt="pretty"))
     conn.close()
 
 def extract_fol_id(text):

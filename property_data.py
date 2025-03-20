@@ -29,12 +29,15 @@ def calculate_hash(property_data):
     """
     Calculate a SHA256 hash for the given property data.
     property_data: tuple or list of values representing key fields.
-    Excludes the PDF file path (index 10) from hash calculation but includes exploration date (index 9).
+    Excludes both the status message (index 8) and PDF file path (index 10) from hash calculation,
+    but includes exploration date (index 9) and the additional AU, BU, NVT area columns.
     """
     # Create a copy of the property data to avoid modifying the original
     hash_data = list(property_data)
     
-    # If we have enough elements, set the PDF file path to empty string to exclude it from the hash
+    # If we have enough elements, exclude status message and PDF file path from hash
+    if len(hash_data) > 8:
+        hash_data[8] = ""  # Exclude status message from hash
     if len(hash_data) > 10:
         hash_data[10] = ""  # Exclude PDF file path from hash
     
@@ -526,9 +529,20 @@ async def extract_ownership(page):
 # -------------------------------
 # Property-Level Extraction
 # -------------------------------
-async def process_property(session, ri):
+async def process_property(session, ri, fol_id):
     eye_selector = f"xpath=//tr[@data-ri='{ri}']//a[contains(@id, 'viewSelectedRowItem')]"
     max_retries = 3
+    
+    # First check if we have an existing record for this FoL-ID
+    existing_data = None
+    exploration_date_unchanged = False
+    try:
+        async with aiosqlite.connect("extraction.db") as db:
+            async with db.execute("SELECT exploration, exploration_pdf FROM property_data WHERE fol_id = ?", (fol_id,)) as cursor:
+                existing_data = await cursor.fetchone()
+    except Exception as e:
+        logging.warning(f"[Session {session.session_id}] Error checking existing property data: {e}")
+    
     for attempt in range(max_retries):
         try:
             eye_link = await session.page.wait_for_selector(eye_selector, timeout=5000)
@@ -543,11 +557,12 @@ async def process_property(session, ri):
             if attempt == max_retries - 1:
                 msg = f"Property tab view still did not appear for data-ri {ri} after {max_retries} attempts: {e}"
                 logging.error(f"[Session {session.session_id}] {msg}")
-                return None, msg
+                return None, msg, "", ""
             else:
                 logging.info(f"[Session {session.session_id}] Refreshing page before retrying attempt {attempt + 2}")
                 await session.page.reload()
                 await asyncio.sleep(3)
+    
     owner_tab_selector = "xpath=//*[@id='processPageForm:propertyTabView']/ul/li[4]/a"
     try:
         owner_tab = await session.page.wait_for_selector(owner_tab_selector, timeout=5000)
@@ -556,7 +571,7 @@ async def process_property(session, ri):
     except Exception as e:
         msg = f"Owner tab not found for data-ri {ri}: {e}"
         logging.error(f"[Session {session.session_id}] {msg}")
-        return None, msg
+        return None, msg, "", ""
 
     try:
         await session.page.wait_for_selector("#processPageForm\\:propertyTabView\\:propertyOwnerTable_data", timeout=10000)
@@ -568,32 +583,42 @@ async def process_property(session, ri):
         owner_data = None
         status_msg = msg
 
-    # --- NEW: Extract Exploration Data with Retry Mechanism ---
+    # --- Extract Exploration Data with Optimization for Unchanged Dates ---
     exploration_date = ""
     exploration_pdf_ref = ""
-    try:
-        exploration_button = await session.page.query_selector("#processPageForm\\:explorationProtocol")
-        if exploration_button:
-            disabled_attr = await exploration_button.get_attribute("disabled")
-            aria_disabled = await exploration_button.get_attribute("aria-disabled")
-            if disabled_attr or (aria_disabled and aria_disabled.lower() == "true"):
-                logging.info(f"[Session {session.session_id}] Exploration protocol button is disabled. Skipping download.")
-            else:
-                logging.info(f"[Session {session.session_id}] Exploration protocol button found and enabled.")
-                exploration_pdf_ref = await download_exploration_pdf(session.page, "#processPageForm\\:explorationProtocol", session.session_id)
-        else:
-            logging.info(f"[Session {session.session_id}] Exploration protocol button not found.")
-    except Exception as e:
-        logging.warning(f"[Session {session.session_id}] Error handling exploration protocol: {e}")
-
+    
+    # First get the exploration date
     try:
         exploration_date_elem = await session.page.query_selector("#processPageForm\\:explorationAgreementDate")
         if exploration_date_elem:
             exploration_date = (await exploration_date_elem.inner_text()).strip()
             logging.info(f"[Session {session.session_id}] Extracted exploration date: {exploration_date}")
+            
+            # Check if exploration date matches the existing record
+            if existing_data and exploration_date == existing_data[0]:
+                exploration_date_unchanged = True
+                exploration_pdf_ref = existing_data[1] if existing_data[1] else ""
+                logging.info(f"[Session {session.session_id}] Exploration date unchanged, reusing PDF reference: {exploration_pdf_ref}")
     except Exception as e:
         logging.warning(f"[Session {session.session_id}] Exploration agreement date not found: {e}")
-    # --- END NEW SECTION ---
+    
+    # Only download if date changed or we don't have the file yet
+    if not exploration_date_unchanged:
+        try:
+            exploration_button = await session.page.query_selector("#processPageForm\\:explorationProtocol")
+            if exploration_button:
+                disabled_attr = await exploration_button.get_attribute("disabled")
+                aria_disabled = await exploration_button.get_attribute("aria-disabled")
+                if disabled_attr or (aria_disabled and aria_disabled.lower() == "true"):
+                    logging.info(f"[Session {session.session_id}] Exploration protocol button is disabled. Skipping download.")
+                else:
+                    logging.info(f"[Session {session.session_id}] Exploration protocol button found and enabled. Downloading...")
+                    exploration_pdf_ref = await download_exploration_pdf(session.page, "#processPageForm\\:explorationProtocol", session.session_id)
+            else:
+                logging.info(f"[Session {session.session_id}] Exploration protocol button not found.")
+        except Exception as e:
+            logging.warning(f"[Session {session.session_id}] Error handling exploration protocol: {e}")
+    # --- END EXPLORATION SECTION ---
 
     close_selector = "#page-header-form\\:closePropertyDetailsPage"
     try:
@@ -603,7 +628,7 @@ async def process_property(session, ri):
         page_html = await session.page.content()
         with open(f"debug_page_{session.session_id}_data-ri_{ri}.html", "w", encoding="utf-8") as f:
             f.write(page_html)
-        return None, f"Close button not found for data-ri {ri}"
+        return None, f"Close button not found for data-ri {ri}", "", ""
     await close_button.click()
     logging.info(f"[Session {session.session_id}] Closed detail page (data-ri {ri})")
     await session.page.wait_for_selector("#searchResultForm\\:propertySearchSRT_data", timeout=10000)
@@ -627,17 +652,30 @@ async def extract_search_results(session):
         street_elem = await row.query_selector("span[title='Street']")
         house_elem = await row.query_selector("span[title='House number']")
         appendix_elem = await row.query_selector("span[title='House number Appndix']")
+        
+        # Extract the additional columns directly from the table
+        au_elem = await row.query_selector("span[title='Accomodation Units']")
+        bu_elem = await row.query_selector("span[title='Business Units']")
+        nvt_area_elem = await row.query_selector("span[title='NVT Area']")
+        
         fol_id = (await fol_elem.inner_text()).strip() if fol_elem else ""
         street = (await street_elem.inner_text()).strip() if street_elem else ""
         house_number = (await house_elem.inner_text()).strip() if house_elem else ""
         house_appendix = (await appendix_elem.inner_text()).strip() if appendix_elem else ""
-        row_data_cache.append((ri, fol_id, street, house_number, house_appendix))
-    for ri, fol_id, street, house_number, house_appendix in row_data_cache:
-        owner_info, status_msg, exploration_date, exploration_pdf_ref = await process_property(session, ri)
+        
+        # Parse values for additional columns
+        au = (await au_elem.inner_text()).strip() if au_elem else ""
+        bu = (await bu_elem.inner_text()).strip() if bu_elem else ""
+        nvt_area = (await nvt_area_elem.inner_text()).strip() if nvt_area_elem else ""
+        
+        row_data_cache.append((ri, fol_id, street, house_number, house_appendix, au, bu, nvt_area))
+        
+    for ri, fol_id, street, house_number, house_appendix, au, bu, nvt_area in row_data_cache:
+        owner_info, status_msg, exploration_date, exploration_pdf_ref = await process_property(session, ri, fol_id)
         if owner_info:
-            combined = [fol_id, street, house_number, house_appendix] + owner_info + [status_msg, exploration_date, exploration_pdf_ref]
+            combined = [fol_id, street, house_number, house_appendix] + owner_info + [status_msg, exploration_date, exploration_pdf_ref, au, bu, nvt_area]
         else:
-            combined = [fol_id, street, house_number, house_appendix, "", "", "", "", status_msg, "", ""]
+            combined = [fol_id, street, house_number, house_appendix, "", "", "", "", status_msg, "", "", au, bu, nvt_area]
         extracted_data.append(combined)
     return extracted_data
 
@@ -658,6 +696,9 @@ async def save_page_data_to_db(session_id, page_number, data):
                 status TEXT,
                 exploration TEXT,
                 exploration_pdf TEXT,
+                au TEXT,
+                bu TEXT,
+                nvt_area TEXT,
                 data_hash TEXT,
                 changed_flag INTEGER DEFAULT 0,
                 last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -671,13 +712,19 @@ async def save_page_data_to_db(session_id, page_number, data):
             await db.execute("ALTER TABLE property_data ADD COLUMN exploration TEXT")
         if "exploration_pdf" not in column_names:
             await db.execute("ALTER TABLE property_data ADD COLUMN exploration_pdf TEXT")
+        if "au" not in column_names:
+            await db.execute("ALTER TABLE property_data ADD COLUMN au TEXT")
+        if "bu" not in column_names:
+            await db.execute("ALTER TABLE property_data ADD COLUMN bu TEXT")
+        if "nvt_area" not in column_names:
+            await db.execute("ALTER TABLE property_data ADD COLUMN nvt_area TEXT")
         await db.commit()
         for row in data:
             new_hash = calculate_hash(row)
             await db.execute("""
                 INSERT INTO property_data 
-                (fol_id, session_id, page, street, house_number, house_appendix, owner_name, owner_email, owner_mobile, owner_landline, status, exploration, exploration_pdf, data_hash, changed_flag)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+                (fol_id, session_id, page, street, house_number, house_appendix, owner_name, owner_email, owner_mobile, owner_landline, status, exploration, exploration_pdf, au, bu, nvt_area, data_hash, changed_flag)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
                 ON CONFLICT(fol_id) DO UPDATE SET
                     street = excluded.street,
                     house_number = excluded.house_number,
@@ -689,10 +736,13 @@ async def save_page_data_to_db(session_id, page_number, data):
                     status = excluded.status,
                     exploration = excluded.exploration,
                     exploration_pdf = excluded.exploration_pdf,
+                    au = excluded.au,
+                    bu = excluded.bu,
+                    nvt_area = excluded.nvt_area,
                     data_hash = CASE WHEN property_data.data_hash <> excluded.data_hash THEN excluded.data_hash ELSE property_data.data_hash END,
                     changed_flag = CASE WHEN property_data.data_hash <> excluded.data_hash THEN 1 ELSE 0 END,
                     last_updated = CURRENT_TIMESTAMP
-            """, (row[0], session_id, page_number, row[1], row[2], row[3], row[4], row[5], row[6], row[7], row[8], row[9], row[10], new_hash))
+            """, (row[0], session_id, page_number, row[1], row[2], row[3], row[4], row[5], row[6], row[7], row[8], row[9], row[10], row[11], row[12], row[13], new_hash))
         await db.commit()
 
 async def click_next_page(session):
@@ -723,15 +773,48 @@ async def go_to_page_by_clicking_number(session, page_number):
             current_page += 1
 
 async def process_page_range(session, start_page, end_page):
+    # Stats for download optimization
+    skipped_downloads = 0
+    new_downloads = 0
+    
     if start_page > 1:
         await go_to_page_by_clicking_number(session, start_page)
     for page_number in range(start_page, end_page + 1):
         logging.info(f"[Session {session.session_id}] Extracting data from page {page_number}")
+        
+        # Get the current download counts before processing the page
+        prev_skipped = skipped_downloads
+        prev_new = new_downloads
+        
+        # Extract and process the page
         page_data = await extract_search_results(session)
+        
+        # Update download stats by checking which properties had unchanged dates
+        for row in page_data:
+            if row[9]:  # If exploration date exists
+                if row[10]:  # If PDF exists
+                    # Check if it's an existing PDF path that was reused
+                    if Path(row[10]).exists() and "downloads in progress" not in row[8].lower():
+                        skipped_downloads += 1
+                else:
+                    new_downloads += 1
+        
+        # Log download statistics
+        if skipped_downloads > prev_skipped or new_downloads > prev_new:
+            logging.info(f"[Session {session.session_id}] Page {page_number} stats: " +
+                         f"Skipped {skipped_downloads - prev_skipped} downloads, " +
+                         f"Downloaded {new_downloads - prev_new} new PDFs")
+        
         await save_page_data_to_db(session.session_id, page_number, page_data)
         logging.info(f"[Session {session.session_id}] Saved data for page {page_number}")
+        
         if page_number < end_page:
             await click_next_page(session)
+    
+    # Log final download statistics
+    logging.info(f"[Session {session.session_id}] FINAL STATS: " +
+                 f"Skipped {skipped_downloads} downloads, " +
+                 f"Downloaded {new_downloads} new PDFs")
 
 # -------------------------------
 # Main & Multi-Session
@@ -803,7 +886,8 @@ async def main():
             all_rows = await cursor.fetchall()
             headers = [
                 "session_id", "page", "fol_id", "street", "house_number",
-                "house_appendix", "owner_name", "owner_email", "owner_mobile", "owner_landline"
+                "house_appendix", "owner_name", "owner_email", "owner_mobile", "owner_landline",
+                "status", "exploration", "exploration_pdf", "au", "bu", "nvt_area"
             ]
             print(tabulate(all_rows, headers=headers, tablefmt="pretty"))
     for s in sessions:
