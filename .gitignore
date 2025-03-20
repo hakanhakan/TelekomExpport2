@@ -52,6 +52,9 @@ user_data/
 *.jpeg
 *.gif
 
+# Exploration files
+*.pdf
+
 # macOS
 .DS_Store
 .AppleDouble

@@ -12,7 +12,7 @@ from tabulate import tabulate
 import aiosqlite
 from rich.console import Console
 import pyotp
-from playwright.async_api import async_playwright, Browser, Page
+from playwright.async_api import async_playwright, Browser, Page, TimeoutError as PlaywrightTimeoutError
 from typing import Optional
 from dotenv import load_dotenv
 from logging.handlers import RotatingFileHandler
@@ -22,22 +22,30 @@ load_dotenv()
 
 console = Console()
 
-# Add new function calculate_hash after imports
+# -------------------------------
+# Utility Functions
+# -------------------------------
 def calculate_hash(property_data):
     """
     Calculate a SHA256 hash for the given property data.
-    property_data: tuple or list of values representing key fields, for example:
-                  [fol_id, street, house_number, house_appendix, owner_name, owner_email, owner_mobile, owner_landline, status]
+    property_data: tuple or list of values representing key fields.
+    Excludes the PDF file path (index 10) from hash calculation but includes exploration date (index 9).
     """
-    # Convert data to JSON string with sorted keys for consistent ordering.
-    data_str = json.dumps(property_data, sort_keys=True)
+    # Create a copy of the property data to avoid modifying the original
+    hash_data = list(property_data)
+    
+    # If we have enough elements, set the PDF file path to empty string to exclude it from the hash
+    if len(hash_data) > 10:
+        hash_data[10] = ""  # Exclude PDF file path from hash
+    
+    # Convert to JSON and calculate hash
+    data_str = json.dumps(hash_data, sort_keys=True)
     return hashlib.sha256(data_str.encode('utf-8')).hexdigest()
 
 def setup_logging(debug=False, quiet=False):
     logger = logging.getLogger()
     logger.handlers.clear()
 
-    # File handler (always verbose)
     file_handler = RotatingFileHandler(
         'ibt_search.log',
         maxBytes=10*1024*1024,
@@ -47,7 +55,6 @@ def setup_logging(debug=False, quiet=False):
     file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
     file_handler.setLevel(logging.DEBUG)
 
-    # Console handler configuration
     console_handler = logging.StreamHandler()
     if quiet:
         console_handler.setLevel(logging.CRITICAL)
@@ -63,15 +70,43 @@ def setup_logging(debug=False, quiet=False):
     logger.addHandler(console_handler)
     logger.setLevel(logging.DEBUG)
 
-# --------------------------------------------------
-# Robust OTP Input Helper and Custom TOTP Class
-# --------------------------------------------------
+# -------------------------------
+# New: Download Retry Function
+# -------------------------------
+async def download_exploration_pdf(page: Page, button_selector: str, session_id: int, max_retries=3, timeout=10000) -> Optional[str]:
+    """
+    Tries to download the exploration PDF up to max_retries times.
+    Returns the path to the downloaded file or None if it fails.
+    """
+    for attempt in range(1, max_retries + 1):
+        try:
+            logging.info(f"[Session {session_id}] Attempting download (attempt {attempt}).")
+            download_future = page.wait_for_event("download", timeout=timeout)
+            await page.click(button_selector)
+            download = await download_future
+            pdf_filename = download.suggested_filename
+            exploration_folder = Path("exploration_protocols")
+            exploration_folder.mkdir(exist_ok=True)
+            destination_path = exploration_folder / pdf_filename
+            await download.save_as(str(destination_path))
+            logging.info(f"[Session {session_id}] Download succeeded on attempt {attempt} -> {destination_path}")
+            return str(destination_path)
+        except PlaywrightTimeoutError:
+            logging.warning(f"[Session {session_id}] Timeout waiting for download on attempt {attempt}. Retrying...")
+        except Exception as e:
+            logging.warning(f"[Session {session_id}] Download failed on attempt {attempt}: {e}")
+    logging.error(f"[Session {session_id}] Download ultimately failed after {max_retries} attempts.")
+    return None
+
+# -------------------------------
+# Robust OTP and Custom TOTP Class
+# -------------------------------
 class CustomTOTP(pyotp.TOTP):
     """Custom TOTP implementation that supports SHA512."""
     def __init__(self, s, digits=6, digest='sha1', interval=30):
         self.secret = s
         self.digits = digits
-        self.digest = digest.lower()  # supports sha1, sha256, sha512
+        self.digest = digest.lower()
         self.interval = interval
 
     def generate_otp(self, counter):
@@ -96,14 +131,8 @@ class CustomTOTP(pyotp.TOTP):
         code = self.generate_otp(counter)
         return str(code).zfill(self.digits)
 
-
 async def robust_otp_input(page, otp_secret, otp_input_selector, otp_submit_selector, max_retries=3):
-    """
-    Waits for the OTP input field, clears it, fills in the OTP code (generated from otp_secret),
-    verifies its value, and then clicks the submit button.
-    """
     def generate_otp_code(secret):
-        # Process otpauth:// URLs
         if secret.startswith("otpauth://"):
             parsed_url = urllib.parse.urlparse(secret)
             query_params = dict(urllib.parse.parse_qsl(parsed_url.query))
@@ -150,11 +179,10 @@ async def robust_otp_input(page, otp_secret, otp_input_selector, otp_submit_sele
 
     return True
 
-# --------------------------------------------------
-# IBT Property Search Session Base Class
-# --------------------------------------------------
+# -------------------------------
+# IBT Property Search Session Classes
+# -------------------------------
 class IBTPropertySearchSession:
-    """Handles individual browser session for property searching"""
     def __init__(self, username: str, password: str, session_id: int, headless=False):
         self.username = username
         self.password = password
@@ -170,23 +198,18 @@ class IBTPropertySearchSession:
         self.download_dir = Path("downloads")
         self.download_dir.mkdir(exist_ok=True)
         self.logger = logging.getLogger(f"Session {self.session_id}")
-        self.otp_secret = None
-        # Load OTP secret from environment variable if available
         self.otp_secret = os.getenv("TELEKOM_OTP_SECRET")
         logging.info(f"Session {self.session_id}: Loaded OTP secret from environment: {self.otp_secret is not None}")
         
     async def init_browser(self):
-        """Initialize browser instance"""
         self.playwright = await async_playwright().start()
         self.browser = await self.playwright.chromium.launch(headless=self.headless)
         self.context = await self.browser.new_context()
         self.page = await self.context.new_page()
 
     async def login(self) -> bool:
-        """Handle login process"""
         try:
             await self.page.goto(self.login_url)
-            
             try:
                 username_field = await self.page.wait_for_selector('input[name="username"]', timeout=5000)
                 if username_field:
@@ -198,65 +221,47 @@ class IBTPropertySearchSession:
                     else:
                         logging.error(f"Session {self.session_id}: Password field not found")
                         return False
-                    
-                    # Look for the specific "Anmelden" button and click it
                     anmelden_button = await self.page.wait_for_selector('input#kc-login[value="Anmelden"]', timeout=5000)
                     if anmelden_button:
                         logging.info(f"Session {self.session_id}: Clicking 'Anmelden' button")
                         await anmelden_button.click()
                     else:
-                        # Fallback to the generic submit button if the specific button is not found
                         logging.info(f"Session {self.session_id}: 'Anmelden' button not found, using generic submit button")
                         await self.page.click('button[type="submit"]')
-                    
                     await self.page.wait_for_timeout(5000)
-                    
                     current_url = self.page.url
                     if "authenticate" in current_url:
                         console.print(f"[yellow]OTP required for session {self.session_id}.[/yellow]")
-                        
                         try:
-                            # Wait for the OTP radio button to be visible
                             otp_radio_button = await self.page.wait_for_selector('input#kc-otp-credential-2[type="radio"]', timeout=5000)
                             if otp_radio_button:
                                 logging.info(f"Session {self.session_id}: Clicking OTP radio button with ID 'kc-otp-credential-2'")
                                 await otp_radio_button.click()
-                                await self.page.wait_for_timeout(1000)  # Short wait after clicking
-                            else:
-                                logging.info(f"Session {self.session_id}: OTP radio button not found")
-                            
-                            # If we have an OTP secret, generate and enter the OTP code
-                            if self.otp_secret:
-                                logging.info(f"Session {self.session_id}: Using OTP secret")
-                                # Generate OTP code
-                                otp_code = self.generate_otp_code(self.otp_secret)
-                                if otp_code:
-                                    logging.info(f"Session {self.session_id}: Generated OTP code: {otp_code}")
-                                    
-                                    # Wait for the OTP input field to be visible
-                                    otp_input = await self.page.wait_for_selector('input#otp[name="otp"]', timeout=5000)
-                                    if otp_input:
-                                        logging.info(f"Session {self.session_id}: Filling OTP code in input field")
-                                        await otp_input.fill(otp_code)
-                                        
-                                        # Look for the submit button and click it
-                                        submit_button = await self.page.wait_for_selector('input[type="submit"]', timeout=5000)
-                                        if submit_button:
-                                            logging.info(f"Session {self.session_id}: Clicking OTP submit button")
-                                            await submit_button.click()
-                                        else:
-                                            logging.info(f"Session {self.session_id}: OTP submit button not found")
-                                    else:
-                                        logging.info(f"Session {self.session_id}: OTP input field not found")
-                                else:
-                                    logging.error(f"Session {self.session_id}: Failed to generate OTP code")
-                            else:
-                                console.print("[yellow]No OTP secret provided. Please enter the OTP manually in the browser.[/yellow]")
+                                await self.page.wait_for_timeout(1000)
                         except Exception as e:
-                            logging.error(f"Session {self.session_id}: Error handling OTP: {str(e)}")
-                        
+                            logging.info(f"Session {self.session_id}: OTP radio button not found: {e}")
+                        if self.otp_secret:
+                            logging.info(f"Session {self.session_id}: Using OTP secret")
+                            otp_code = self.generate_otp_code(self.otp_secret)
+                            if otp_code:
+                                logging.info(f"Session {self.session_id}: Generated OTP code: {otp_code}")
+                                otp_input = await self.page.wait_for_selector('input#otp[name="otp"]', timeout=5000)
+                                if otp_input:
+                                    logging.info(f"Session {self.session_id}: Filling OTP code in input field")
+                                    await otp_input.fill(otp_code)
+                                    submit_button = await self.page.wait_for_selector('input[type="submit"]', timeout=5000)
+                                    if submit_button:
+                                        logging.info(f"Session {self.session_id}: Clicking OTP submit button")
+                                        await submit_button.click()
+                                    else:
+                                        logging.info(f"Session {self.session_id}: OTP submit button not found")
+                                else:
+                                    logging.info(f"Session {self.session_id}: OTP input field not found")
+                            else:
+                                logging.error(f"Session {self.session_id}: Failed to generate OTP code")
+                        else:
+                            console.print("[yellow]No OTP secret provided. Please enter the OTP manually in the browser.[/yellow]")
                         console.print("[yellow]Waiting for OTP verification to complete...[/yellow]")
-                        
                         max_wait = 120
                         for _ in range(max_wait):
                             current_url = self.page.url
@@ -269,10 +274,8 @@ class IBTPropertySearchSession:
                             return False
                     else:
                         logging.info(f"Session {self.session_id}: No OTP required")
-                    
                     console.print("[yellow]Please complete the OTP verification in the browser window.[/yellow]")
                     console.print("[yellow]The script will continue once you're logged in.[/yellow]")
-                    
                     max_wait = 120
                     for _ in range(max_wait):
                         current_url = self.page.url
@@ -285,113 +288,79 @@ class IBTPropertySearchSession:
                         return False
             except Exception as e:
                 logging.info(f"Session {self.session_id}: Already logged in or login page not as expected: {str(e)}")
-            
             await self.page.wait_for_timeout(5000)
-            
             current_url = self.page.url
             logging.info(f"Session {self.session_id}: Current URL after login process: {current_url}")
-            
             if "order/ibtorder/search" in current_url:
                 logging.info(f"Session {self.session_id}: Successfully logged in")
                 await self.page.goto(self.search_url)
                 await self.page.wait_for_timeout(5000)
-                
                 console.print(f"[green]Successfully logged in session {self.session_id} and navigated to property search![/green]")
                 return True
             else:
                 logging.error(f"Session {self.session_id}: Failed to reach the expected page after login")
                 return False
-            
         except Exception as e:
             logging.error(f"Login failed for session {self.session_id}: {str(e)}")
             return False
 
     def generate_otp_code(self, otp_secret):
-        """Generate an OTP code from the given secret"""
         if not otp_secret:
             logging.error(f"Session {self.session_id}: No OTP secret provided")
             return None
-        
         logging.info(f"Session {self.session_id}: Attempting to generate OTP code from secret")
-        
         try:
-            # Check if the input is already a otpauth:// URL
             if otp_secret.startswith('otpauth://'):
                 logging.info(f"Session {self.session_id}: Processing otpauth:// URL")
-                # Parse the otpauth URL
                 parsed_url = urllib.parse.urlparse(otp_secret)
                 query_params = dict(urllib.parse.parse_qsl(parsed_url.query))
-                
-                # Extract the secret from the query parameters
                 secret = query_params.get('secret')
                 if not secret:
                     logging.error(f"Session {self.session_id}: No secret found in otpauth URL")
                     return None
-                
                 logging.info(f"Session {self.session_id}: Extracted secret")
-                
-                # Get algorithm if specified
                 algorithm = query_params.get('algorithm', 'SHA1')
                 logging.info(f"Session {self.session_id}: Using algorithm: {algorithm}")
-                
-                # Get digits if specified
                 digits = int(query_params.get('digits', 6))
                 logging.info(f"Session {self.session_id}: Using digits: {digits}")
-                
-                # Get period if specified
                 period = int(query_params.get('period', 30))
                 logging.info(f"Session {self.session_id}: Using period: {period}")
-                
-                # Generate the OTP code
                 if algorithm.upper() == 'SHA512':
                     logging.info(f"Session {self.session_id}: Using custom TOTP implementation for SHA512")
                     totp = CustomTOTP(secret, digits=digits, digest='sha512', interval=period)
                 else:
-                    # Use standard PyOTP for other algorithms
                     totp = pyotp.TOTP(secret, digits=digits, digest=algorithm.lower(), interval=period)
-                
                 otp_code = totp.now()
                 logging.info(f"Session {self.session_id}: Generated OTP code: {otp_code}")
                 return otp_code
-            # Special case for format like "totp/Telekom:hakan%40ekerfiber.com?secret=..."
             elif 'secret=' in otp_secret:
                 logging.info(f"Session {self.session_id}: Processing partial otpauth URL")
-                # Extract the secret parameter
                 secret_param = otp_secret.split('secret=')[1].split('&')[0]
                 logging.info(f"Session {self.session_id}: Extracted secret")
-                
-                # Extract other parameters if available
                 digits = 6
                 if 'digits=' in otp_secret:
                     digits_str = otp_secret.split('digits=')[1].split('&')[0]
                     digits = int(digits_str)
                     logging.info(f"Session {self.session_id}: Using digits: {digits}")
-                
                 algorithm = 'SHA1'
                 if 'algorithm=' in otp_secret:
                     algorithm = otp_secret.split('algorithm=')[1].split('&')[0]
                     logging.info(f"Session {self.session_id}: Using algorithm: {algorithm}")
-                
                 period = 30
                 if 'period=' in otp_secret:
                     period_str = otp_secret.split('period=')[1].split('&')[0]
                     period = int(period_str)
                     logging.info(f"Session {self.session_id}: Using period: {period}")
-                
-                # Generate the OTP code
                 if algorithm.upper() == 'SHA512':
                     logging.info(f"Session {self.session_id}: Using custom TOTP implementation for SHA512")
                     totp = CustomTOTP(secret_param, digits=digits, digest='sha512', interval=period)
                 else:
-                    # Use standard PyOTP for other algorithms
                     totp = pyotp.TOTP(secret_param, digits=digits, digest=algorithm.lower(), interval=period)
-                
                 otp_code = totp.now()
                 logging.info(f"Session {self.session_id}: Generated OTP code: {otp_code}")
                 return otp_code
             else:
                 logging.info(f"Session {self.session_id}: Using direct secret")
-                # Try to use the string directly as a secret
                 totp = pyotp.TOTP(otp_secret)
                 otp_code = totp.now()
                 logging.info(f"Session {self.session_id}: Generated OTP code: {otp_code}")
@@ -399,9 +368,8 @@ class IBTPropertySearchSession:
         except Exception as e:
             logging.error(f"Session {self.session_id}: Error generating OTP code: {str(e)}")
             return None
-            
+
     async def close(self):
-        """Close the browser session"""
         try:
             if self.page:
                 try:
@@ -409,39 +377,34 @@ class IBTPropertySearchSession:
                     self.page = None
                 except Exception as e:
                     logging.error(f"Session {self.session_id}: Error closing page: {str(e)}")
-            
             if self.context:
                 try:
                     await self.context.close()
                     self.context = None
                 except Exception as e:
                     logging.error(f"Session {self.session_id}: Error closing context: {str(e)}")
-            
             if self.browser:
                 try:
                     await self.browser.close()
                     self.browser = None
                 except Exception as e:
                     logging.error(f"Session {self.session_id}: Error closing browser: {str(e)}")
-            
             if self.playwright:
                 try:
                     await self.playwright.stop()
                     self.playwright = None
                 except Exception as e:
                     logging.error(f"Session {self.session_id}: Error stopping playwright: {str(e)}")
-                    
             logging.info(f"Session {self.session_id}: Browser session closed")
         except Exception as e:
             logging.error(f"Session {self.session_id}: Error during close: {str(e)}")
             console.print(f"[red]Error closing browser: {str(e)}[/red]")
 
-# --------------------------------------------------
-# Subclass to Override Login for Robust OTP Handling
-# --------------------------------------------------
+# -------------------------------
+# Subclass for Robust OTP Handling
+# -------------------------------
 class RobustIBTPropertySearchSession(IBTPropertySearchSession):
     async def login(self) -> bool:
-        """Override login method to use robust OTP input."""
         try:
             await self.page.goto(self.login_url)
             username_field = await self.page.wait_for_selector('input[name="username"]', timeout=5000)
@@ -454,7 +417,6 @@ class RobustIBTPropertySearchSession(IBTPropertySearchSession):
                 else:
                     logging.error(f"Session {self.session_id}: Password field not found")
                     return False
-
                 anmelden_button = await self.page.wait_for_selector('input#kc-login[value="Anmelden"]', timeout=5000)
                 if anmelden_button:
                     logging.info(f"Session {self.session_id}: Clicking 'Anmelden' button")
@@ -462,10 +424,8 @@ class RobustIBTPropertySearchSession(IBTPropertySearchSession):
                 else:
                     logging.info(f"Session {self.session_id}: 'Anmelden' button not found, using generic submit")
                     await self.page.click('button[type="submit"]')
-
                 await self.page.wait_for_timeout(5000)
                 current_url = self.page.url
-
                 if "authenticate" in current_url:
                     console.print(f"[yellow]OTP required for session {self.session_id}.[/yellow]")
                     try:
@@ -476,8 +436,6 @@ class RobustIBTPropertySearchSession(IBTPropertySearchSession):
                             await self.page.wait_for_timeout(1000)
                     except Exception as e:
                         logging.warning(f"Session {self.session_id}: OTP radio button error: {e}")
-
-                    # Re-read OTP secret for this session to generate a fresh OTP code.
                     self.otp_secret = os.getenv("TELEKOM_OTP_SECRET")
                     if self.otp_secret:
                         logging.info(f"Session {self.session_id}: Using OTP secret.")
@@ -491,9 +449,7 @@ class RobustIBTPropertySearchSession(IBTPropertySearchSession):
                             return False
                     else:
                         console.print("[yellow]No OTP secret provided. Please enter OTP manually in the browser.[/yellow]")
-
                     console.print("[yellow]Waiting for OTP verification to complete...[/yellow]")
-                    # Wait for OTP verification (retrying if needed)
                     for _ in range(12):
                         if "authenticate" not in self.page.url:
                             logging.info(f"Session {self.session_id}: OTP verification completed")
@@ -501,14 +457,11 @@ class RobustIBTPropertySearchSession(IBTPropertySearchSession):
                         await self.page.wait_for_timeout(1000)
                     else:
                         logging.warning(f"Session {self.session_id}: OTP verification did not complete after first try.")
-
-                    # If still on authentication page, retry a few times.
                     max_otp_attempts = 3
                     attempts = 0
                     while "authenticate" in self.page.url and attempts < max_otp_attempts:
                         logging.info(f"Session {self.session_id}: OTP verification failed, retrying new OTP attempt {attempts + 1}")
                         await self.page.wait_for_timeout(2000)
-                        # Re-read OTP secret here as well if you expect it might change
                         self.otp_secret = os.getenv("TELEKOM_OTP_SECRET")
                         success = await robust_otp_input(
                             self.page,
@@ -521,7 +474,6 @@ class RobustIBTPropertySearchSession(IBTPropertySearchSession):
                             return False
                         await self.page.wait_for_timeout(5000)
                         attempts += 1
-
                     if "authenticate" in self.page.url:
                         logging.error(f"Session {self.session_id}: OTP verification ultimately failed after {attempts} attempts")
                         return False
@@ -530,7 +482,6 @@ class RobustIBTPropertySearchSession(IBTPropertySearchSession):
             await self.page.wait_for_timeout(5000)
             current_url = self.page.url
             logging.info(f"Session {self.session_id}: Current URL after login: {current_url}")
-
             if "order/ibtorder/search" in current_url:
                 logging.info(f"Session {self.session_id}: Successfully logged in")
                 await self.page.goto(self.search_url)
@@ -540,28 +491,21 @@ class RobustIBTPropertySearchSession(IBTPropertySearchSession):
             else:
                 logging.error(f"Session {self.session_id}: Failed to reach the expected page after login")
                 return False
-
         except Exception as e:
             logging.error(f"Login failed for session {self.session_id}: {e}")
             return False
 
-# --------------------------------------------------
+# -------------------------------
 # Ownership Extraction
-# --------------------------------------------------
+# -------------------------------
 async def extract_ownership(page):
-    """
-    Extract owner data from the Owner tab.
-    Returns the decision maker's data or None if not found.
-    """
     try:
         await page.wait_for_selector("#processPageForm\\:propertyTabView\\:propertyOwnerTable_data", timeout=10000)
     except Exception as e:
         logging.warning(f"Owner table did not appear: {e}")
-        return None  # Return None if the table isn’t found
-
+        return None
     owner_rows = await page.query_selector_all("#processPageForm\\:propertyTabView\\:propertyOwnerTable_data tr")
     decision_owner = None
-
     for row in owner_rows:
         decision_elem = await row.query_selector("td:last-child span.fa-check[title='Decision Maker']")
         if decision_elem:
@@ -571,7 +515,6 @@ async def extract_ownership(page):
                 email_span = await tds[1].query_selector("span")
                 mobile_span = await tds[2].query_selector("span")
                 landline_span = await tds[3].query_selector("span")
-
                 name = (await name_span.inner_text()).strip() if name_span else ""
                 email = (await email_span.inner_text()).strip() if email_span else ""
                 mobile = (await mobile_span.inner_text()).strip() if mobile_span else ""
@@ -580,37 +523,31 @@ async def extract_ownership(page):
             break
     return decision_owner
 
-# --------------------------------------------------
+# -------------------------------
 # Property-Level Extraction
-# --------------------------------------------------
+# -------------------------------
 async def process_property(session, ri):
-    # Define the selector for the eye icon.
     eye_selector = f"xpath=//tr[@data-ri='{ri}']//a[contains(@id, 'viewSelectedRowItem')]"
     max_retries = 3
     for attempt in range(max_retries):
         try:
-            # Click the eye icon.
             eye_link = await session.page.wait_for_selector(eye_selector, timeout=5000)
             await eye_link.click()
             logging.info(f"[Session {session.session_id}] Clicked eye icon for data-ri {ri} (Attempt {attempt + 1})")
-            # Wait a short time to allow the detail view to open.
             await session.page.wait_for_timeout(2000)
-            # Wait for the property detail view to appear.
             await session.page.wait_for_selector("#processPageForm\\:propertyTabView", timeout=15000)
             logging.info(f"[Session {session.session_id}] Property tab view appeared for data-ri {ri} on attempt {attempt + 1}")
-            break  # Exit loop if successful.
+            break
         except Exception as e:
             logging.warning(f"[Session {session.session_id}] Attempt {attempt + 1} to open detail page for data-ri {ri} failed: {e}")
             if attempt == max_retries - 1:
                 msg = f"Property tab view still did not appear for data-ri {ri} after {max_retries} attempts: {e}"
                 logging.error(f"[Session {session.session_id}] {msg}")
-                return None, msg  # Return error status after final attempt.
+                return None, msg
             else:
                 logging.info(f"[Session {session.session_id}] Refreshing page before retrying attempt {attempt + 2}")
                 await session.page.reload()
                 await asyncio.sleep(3)
-    
-    # Continue with the rest of the process if the detail view is successfully opened.
     owner_tab_selector = "xpath=//*[@id='processPageForm:propertyTabView']/ul/li[4]/a"
     try:
         owner_tab = await session.page.wait_for_selector(owner_tab_selector, timeout=5000)
@@ -631,28 +568,19 @@ async def process_property(session, ri):
         owner_data = None
         status_msg = msg
 
-    # --- NEW: Extract Exploration Data ---
+    # --- NEW: Extract Exploration Data with Retry Mechanism ---
     exploration_date = ""
     exploration_pdf_ref = ""
     try:
         exploration_button = await session.page.query_selector("#processPageForm\\:explorationProtocol")
         if exploration_button:
-            # Check if the button is enabled.
             disabled_attr = await exploration_button.get_attribute("disabled")
             aria_disabled = await exploration_button.get_attribute("aria-disabled")
             if disabled_attr or (aria_disabled and aria_disabled.lower() == "true"):
                 logging.info(f"[Session {session.session_id}] Exploration protocol button is disabled. Skipping download.")
             else:
                 logging.info(f"[Session {session.session_id}] Exploration protocol button found and enabled.")
-                download_future = session.page.wait_for_event("download", timeout=10000)
-                await exploration_button.click()
-                download = await download_future
-                pdf_filename = download.suggested_filename
-                exploration_folder = Path("exploration_protocols")
-                exploration_folder.mkdir(exist_ok=True)
-                destination_path = exploration_folder / pdf_filename
-                await download.save_as(str(destination_path))
-                exploration_pdf_ref = str(destination_path)
+                exploration_pdf_ref = await download_exploration_pdf(session.page, "#processPageForm\\:explorationProtocol", session.session_id)
         else:
             logging.info(f"[Session {session.session_id}] Exploration protocol button not found.")
     except Exception as e:
@@ -667,66 +595,52 @@ async def process_property(session, ri):
         logging.warning(f"[Session {session.session_id}] Exploration agreement date not found: {e}")
     # --- END NEW SECTION ---
 
-    # Close the detail page.
-    close_selector = "#processPageForm\\:j_idt340 span"
+    close_selector = "#page-header-form\\:closePropertyDetailsPage"
     try:
         close_button = await session.page.wait_for_selector(close_selector, timeout=5000)
-    except Exception:
-        close_selector = "xpath=//*[@id='processPageForm:j_idt341']/span"
-        close_button = await session.page.wait_for_selector(close_selector, timeout=5000)
+    except Exception as e:
+        logging.error(f"Close button not found with selector '{close_selector}'. Exception: {e}")
+        page_html = await session.page.content()
+        with open(f"debug_page_{session.session_id}_data-ri_{ri}.html", "w", encoding="utf-8") as f:
+            f.write(page_html)
+        return None, f"Close button not found for data-ri {ri}"
     await close_button.click()
     logging.info(f"[Session {session.session_id}] Closed detail page (data-ri {ri})")
     await session.page.wait_for_selector("#searchResultForm\\:propertySearchSRT_data", timeout=10000)
     return owner_data, status_msg, exploration_date, exploration_pdf_ref
 
-# --------------------------------------------------
-# Page Extraction
-# --------------------------------------------------
+# -------------------------------
+# Page Extraction and Navigation Helpers
+# -------------------------------
 async def extract_search_results(session):
-    """
-    Extract static data from the current page's table rows.
-    For each row, retrieve its "data-ri" attribute and basic property details,
-    then call process_property for that specific row.
-    Returns a list of rows:
-    [FoL-ID, Street, House number, House number Appendix, Owner Name, Owner Email, Owner Mobile, Owner Landline, Status].
-    """
     try:
         await session.page.wait_for_selector("#searchResultForm\\:propertySearchSRT_data", timeout=10000)
     except Exception as e:
         logging.error(f"[Session {session.session_id}] Search results table not found: {e}")
         return []
-
     rows = await session.page.query_selector_all("#searchResultForm\\:propertySearchSRT_data tr")
     extracted_data = []
     row_data_cache = []
-
     for row in rows:
         ri = await row.get_attribute("data-ri")
         fol_elem = await row.query_selector("span[title='FoL-Id']")
         street_elem = await row.query_selector("span[title='Street']")
         house_elem = await row.query_selector("span[title='House number']")
         appendix_elem = await row.query_selector("span[title='House number Appndix']")
-
         fol_id = (await fol_elem.inner_text()).strip() if fol_elem else ""
         street = (await street_elem.inner_text()).strip() if street_elem else ""
         house_number = (await house_elem.inner_text()).strip() if house_elem else ""
         house_appendix = (await appendix_elem.inner_text()).strip() if appendix_elem else ""
         row_data_cache.append((ri, fol_id, street, house_number, house_appendix))
-
     for ri, fol_id, street, house_number, house_appendix in row_data_cache:
-        # process_property now returns a tuple: (owner_info, status_msg, exploration_date, exploration_pdf_ref)
         owner_info, status_msg, exploration_date, exploration_pdf_ref = await process_property(session, ri)
         if owner_info:
             combined = [fol_id, street, house_number, house_appendix] + owner_info + [status_msg, exploration_date, exploration_pdf_ref]
         else:
             combined = [fol_id, street, house_number, house_appendix, "", "", "", "", status_msg, "", ""]
         extracted_data.append(combined)
-
     return extracted_data
 
-# --------------------------------------------------
-# Database Functions
-# --------------------------------------------------
 async def save_page_data_to_db(session_id, page_number, data):
     async with aiosqlite.connect("extraction.db") as db:
         await db.execute("""
@@ -750,8 +664,6 @@ async def save_page_data_to_db(session_id, page_number, data):
             )
         """)
         await db.commit()
-
-        # Check existing schema and add missing columns if necessary.
         async with db.execute("PRAGMA table_info(property_data)") as cursor:
             columns = await cursor.fetchall()
         column_names = [col[1] for col in columns]
@@ -760,7 +672,6 @@ async def save_page_data_to_db(session_id, page_number, data):
         if "exploration_pdf" not in column_names:
             await db.execute("ALTER TABLE property_data ADD COLUMN exploration_pdf TEXT")
         await db.commit()
-
         for row in data:
             new_hash = calculate_hash(row)
             await db.execute("""
@@ -784,9 +695,6 @@ async def save_page_data_to_db(session_id, page_number, data):
             """, (row[0], session_id, page_number, row[1], row[2], row[3], row[4], row[5], row[6], row[7], row[8], row[9], row[10], new_hash))
         await db.commit()
 
-# --------------------------------------------------
-# Page Navigation Helpers
-# --------------------------------------------------
 async def click_next_page(session):
     next_selector = "#searchResultForm\\:propertySearchSRT_paginator_top > a.ui-paginator-next > span"
     try:
@@ -814,40 +722,32 @@ async def go_to_page_by_clicking_number(session, page_number):
             await click_next_page(session)
             current_page += 1
 
-# --------------------------------------------------
-# Range Processing
-# --------------------------------------------------
 async def process_page_range(session, start_page, end_page):
     if start_page > 1:
         await go_to_page_by_clicking_number(session, start_page)
-
     for page_number in range(start_page, end_page + 1):
         logging.info(f"[Session {session.session_id}] Extracting data from page {page_number}")
         page_data = await extract_search_results(session)
         await save_page_data_to_db(session.session_id, page_number, page_data)
         logging.info(f"[Session {session.session_id}] Saved data for page {page_number}")
-
         if page_number < end_page:
             await click_next_page(session)
 
-# --------------------------------------------------
+# -------------------------------
 # Main & Multi-Session
-# --------------------------------------------------
+# -------------------------------
 async def main():
     setup_logging(debug=True)
-
-    total_pages = 51     # Adjust total pages for your test.
-    num_sessions = 1    # Number of concurrent sessions.
+    total_pages = 49
+    num_sessions = 4
     pages_per_session = total_pages // num_sessions
-
     sessions = []
-    # Create and log in each session using our robust subclass.
     for i in range(num_sessions):
         s = RobustIBTPropertySearchSession(
             username=os.getenv("TELEKOM_USERNAME"),
             password=os.getenv("TELEKOM_PASSWORD"),
             session_id=i,
-            headless=False  # Set to True for headless mode.
+            headless=True
         )
         s.otp_secret = os.getenv("TELEKOM_OTP_SECRET")
         await s.init_browser()
@@ -856,12 +756,9 @@ async def main():
             continue
         logging.info(f"Successfully logged in session {i}")
         sessions.append(s)
-
     if not sessions:
         logging.error("No sessions available. Exiting.")
         return
-
-    # Set the same search criteria for all sessions.
     for s in sessions:
         area = "Bad Sooden-Allendorf, Stadt"
         logging.info(f"[Session {s.session_id}] Setting search criteria for area: {area}")
@@ -877,8 +774,6 @@ async def main():
             await suggestion.click()
         except Exception as e:
             logging.error(f"[Session {s.session_id}] Failed area input: {e}")
-
-        # Set number of results.
         try:
             dropdown = await s.page.wait_for_selector("xpath=//*[@id='searchCriteriaForm:nrOfResults']/div[3]/span", timeout=5000)
             await dropdown.click()
@@ -887,16 +782,12 @@ async def main():
             logging.info(f"[Session {s.session_id}] Set number of results to 2500 (option index 6).")
         except Exception as e:
             logging.error(f"[Session {s.session_id}] Failed to set number of results: {e}")
-
-        # Click the search button.
         try:
             search_btn = await s.page.wait_for_selector("#searchCriteriaForm\\:searchButton", timeout=10000)
             await search_btn.click()
             await asyncio.sleep(5)
         except Exception as e:
             logging.error(f"[Session {s.session_id}] Could not click search: {e}")
-
-    # Distribute page ranges among sessions.
     tasks = []
     for i, s in enumerate(sessions):
         start_page = i * pages_per_session + 1
@@ -904,13 +795,9 @@ async def main():
             end_page = total_pages
         else:
             end_page = (i + 1) * pages_per_session
-
         logging.info(f"[Session {s.session_id}] Assigned pages {start_page} to {end_page}")
         tasks.append(process_page_range(s, start_page, end_page))
-
     await asyncio.gather(*tasks)
-
-    # (Optional) Print combined results from the SQLite database.
     async with aiosqlite.connect("extraction.db") as db:
         async with db.execute("SELECT * FROM property_data") as cursor:
             all_rows = await cursor.fetchall()
@@ -919,8 +806,6 @@ async def main():
                 "house_appendix", "owner_name", "owner_email", "owner_mobile", "owner_landline"
             ]
             print(tabulate(all_rows, headers=headers, tablefmt="pretty"))
-
-    # Close all sessions.
     for s in sessions:
         await s.close()
     logging.info("All sessions closed.")
