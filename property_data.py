@@ -643,9 +643,12 @@ async def extract_search_results(session):
     except Exception as e:
         logging.error(f"[Session {session.session_id}] Search results table not found: {e}")
         return []
+    
     rows = await session.page.query_selector_all("#searchResultForm\\:propertySearchSRT_data tr")
     extracted_data = []
     row_data_cache = []
+    
+    # First, gather basic property information
     for row in rows:
         ri = await row.get_attribute("data-ri")
         fol_elem = await row.query_selector("span[title='FoL-Id']")
@@ -669,14 +672,77 @@ async def extract_search_results(session):
         nvt_area = (await nvt_area_elem.inner_text()).strip() if nvt_area_elem else ""
         
         row_data_cache.append((ri, fol_id, street, house_number, house_appendix, au, bu, nvt_area))
-        
+    
+    # Now process each property with retry mechanism for failed owner extractions
     for ri, fol_id, street, house_number, house_appendix, au, bu, nvt_area in row_data_cache:
+        # Process the property
         owner_info, status_msg, exploration_date, exploration_pdf_ref = await process_property(session, ri, fol_id)
+        
+        # If owner extraction failed, retry up to 2 more times
+        retry_count = 0
+        max_retries = 2
+        
+        # Check if owner info extraction failed but not because of a missing owner table
+        # (We don't want to retry if the property legitimately has no owner information)
+        while (owner_info is None and 
+               retry_count < max_retries and 
+               "not found" not in status_msg.lower() and
+               "table not found" not in status_msg.lower()):
+            
+            logging.warning(f"[Session {session.session_id}] Owner extraction failed for FoL-ID {fol_id}. "
+                          f"Retrying ({retry_count + 1}/{max_retries})...")
+            
+            # Wait a moment before retry
+            await asyncio.sleep(2)
+            
+            # Reopen the property detail page and retry extraction
+            eye_selector = f"xpath=//tr[@data-ri='{ri}']//a[contains(@id, 'viewSelectedRowItem')]"
+            try:
+                eye_link = await session.page.wait_for_selector(eye_selector, timeout=5000)
+                await eye_link.click()
+                logging.info(f"[Session {session.session_id}] Clicked eye icon for retry on FoL-ID {fol_id}")
+                await session.page.wait_for_timeout(2000)
+                await session.page.wait_for_selector("#processPageForm\\:propertyTabView", timeout=15000)
+                
+                # Navigate to the owner tab
+                owner_tab_selector = "xpath=//*[@id='processPageForm:propertyTabView']/ul/li[4]/a"
+                owner_tab = await session.page.wait_for_selector(owner_tab_selector, timeout=5000)
+                await owner_tab.click()
+                
+                # Retry owner extraction
+                try:
+                    await session.page.wait_for_selector("#processPageForm\\:propertyTabView\\:propertyOwnerTable_data", timeout=10000)
+                    owner_info = await extract_ownership(session.page)
+                    if owner_info is not None:
+                        status_msg = "Recovered owner info on retry"
+                        logging.info(f"[Session {session.session_id}] Successfully recovered owner info for FoL-ID {fol_id} on retry {retry_count + 1}")
+                except Exception as e:
+                    status_msg = f"Owner table not found on retry {retry_count + 1}: {e}"
+                
+                # Close the property detail page
+                close_selector = "#page-header-form\\:closePropertyDetailsPage"
+                close_button = await session.page.wait_for_selector(close_selector, timeout=5000)
+                await close_button.click()
+                await session.page.wait_for_selector("#searchResultForm\\:propertySearchSRT_data", timeout=10000)
+                
+            except Exception as e:
+                status_msg = f"Retry {retry_count + 1} failed: {e}"
+                logging.error(f"[Session {session.session_id}] {status_msg}")
+            
+            retry_count += 1
+        
+        # Add the retry information to the status message if retries were performed
+        if retry_count > 0 and "Recovered" not in status_msg:
+            status_msg += f" (After {retry_count} retries)"
+        
+        # Create the final data row
         if owner_info:
             combined = [fol_id, street, house_number, house_appendix] + owner_info + [status_msg, exploration_date, exploration_pdf_ref, au, bu, nvt_area]
         else:
             combined = [fol_id, street, house_number, house_appendix, "", "", "", "", status_msg, "", "", au, bu, nvt_area]
+        
         extracted_data.append(combined)
+    
     return extracted_data
 
 async def save_page_data_to_db(session_id, page_number, data):
